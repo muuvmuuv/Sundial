@@ -1,0 +1,123 @@
+name: release
+
+# Pushes to main, PRs, and tag pushes all build, lint, and run tests. Only a `v*` tag runs the
+# signing, notarization, and release steps below (guarded with `if: startsWith(github.ref, 'refs/tags/')`).
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  build:
+    # SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor requires the Xcode 26 / Swift 6.2 toolchain,
+    # so this needs a runner image that ships it.
+    runs-on: macos-26
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 26
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+
+      - name: Lint
+        run: |
+          brew install swiftlint
+          swift format lint --strict --recursive Sundial SundialTests
+          swiftlint --strict
+
+      - name: Test
+        run: |
+          # Ad hoc signing: this runner has no Developer ID cert, and none is needed to run the
+          # hosted unit tests.
+          xcodebuild test \
+            -project Sundial.xcodeproj \
+            -scheme Sundial \
+            -destination 'platform=macOS' \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_REQUIRED=NO
+
+      # --- everything below only runs for a `v*` tag push ---
+
+      - name: Import Developer ID certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          CERT: ${{ secrets.DEVELOPER_ID_APP_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_APP_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$CERT" | base64 --decode > cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security list-keychains -d user -s build.keychain login.keychain
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm cert.p12
+
+      - name: Archive
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          xcodebuild archive \
+            -project Sundial.xcodeproj \
+            -scheme Sundial \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath build/Sundial.xcarchive \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM=5JF28JDTVC \
+            OTHER_CODE_SIGN_FLAGS="--timestamp"
+          # The team ID is not a secret and is hardcoded here on purpose: ci/ExportOptions.plist
+          # carries the same literal value, and a secret would let the two silently drift apart.
+          # Hardened Runtime is already enabled by the Release configuration's build settings
+          # (ENABLE_HARDENED_RUNTIME = YES), so `--options runtime` is deliberately omitted above.
+
+      - name: Exclude build directory from Time Machine
+        if: startsWith(github.ref, 'refs/tags/')
+        # Harmless no-op on this CI runner, but keeps the same pipeline safe to run locally
+        # without Time Machine backing up regenerable archive/export artifacts.
+        run: tmutil addexclusion build || true
+
+      - name: Export .app
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath build/Sundial.xcarchive \
+            -exportOptionsPlist ci/ExportOptions.plist \
+            -exportPath build/export
+
+      - name: Notarize + staple
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+          KEY_P8: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+        run: |
+          echo "$KEY_P8" | base64 --decode > ac_api.p8
+          APP="build/export/Sundial.app"
+          ditto -c -k --keepParent "$APP" build/Sundial.zip
+          xcrun notarytool submit build/Sundial.zip \
+            --key ac_api.p8 --key-id "$KEY_ID" --issuer "$ISSUER_ID" --wait
+          xcrun stapler staple "$APP"
+          rm ac_api.p8
+
+      - name: Package DMG
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          brew install create-dmg
+          create-dmg --volname "Sundial" --app-drop-link 420 180 \
+            build/Sundial.dmg build/export/Sundial.app || true
+          # create-dmg exits nonzero on cosmetic AppleScript/Finder warnings even when the dmg
+          # was produced successfully, so check for the file rather than the exit code.
+          test -f build/Sundial.dmg
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Sundial.dmg
+          generate_release_notes: true
+
+      # No Mac App Store step: the private SkyLight switch cannot pass App Review, and there is
+      # no sandboxed fallback worth shipping. Developer ID + notarization is the only pipeline.
